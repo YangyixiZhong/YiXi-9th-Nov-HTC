@@ -10,6 +10,8 @@ Two modes, so you can see the difference:
   MODE=agent    -> AI gets a goal + tools and chooses what to do next.
 """
 import json
+import re
+import time
 import os
 import sys
 import xml.etree.ElementTree as XML
@@ -18,13 +20,16 @@ from datetime import datetime, timedelta
 import icalendar
 import recurring_ical_events
 import requests
-from openai import OpenAI
+from openai import OpenAI, APIStatusError, RateLimitError
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
 MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 SCHOOL_DOMAIN = os.environ.get("SCHOOL_DOMAIN", "cornell.edu")
-MAX_AGENT_STEPS = 20
+MAX_AGENT_STEPS = 5
+MAX_WEB_SEARCHES = 2
+MAX_TOOL_RESULT_CHARS = 1100
+MAX_COMPLETION_TOKENS = 500
 
 
 # ---------------------------------------------------------------- tools
@@ -64,9 +69,9 @@ def web_search(query):
     """Search the web with Tavily (free tier)."""
     r = requests.post("https://api.tavily.com/search",
                       headers={"Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}"},
-                      json={"query": query, "max_results": 5}, timeout=30)
+                      json={"query": query, "max_results": 3}, timeout=30)
     r.raise_for_status()
-    return [{"title": x.get("title"), "url": x.get("url"), "snippet": (x.get("content") or "")[:400]}
+    return [{"title": x.get("title"), "url": x.get("url"), "snippet": (x.get("content") or "")[:220]}
             for x in r.json().get("results", [])]
 
 
@@ -77,7 +82,7 @@ def company_news(company):
     r.raise_for_status()
     items = [{"title": i.findtext("title"), "published": i.findtext("pubDate")}
              for i in XML.fromstring(r.content).iter("item")]
-    return {"company": company, "headlines": items[:6] or "No recent news found."}
+    return {"company": company, "headlines": items[:3] or "No recent news found."}
 
 
 TOOLS = [
@@ -127,6 +132,9 @@ You decide what to do. Guidelines:
   (title, team, past companies). Never include anything about their personal life, family or home.
 - Find genuine shared ground with me using my profile below. Never invent any.
 - If you can't identify someone, say so. Don't guess.
+- Never confuse MY PROFILE with the meeting attendee; do not search for me as the attendee.
+- Use at most two distinct web searches TOTAL, never repeat or rephrase a search.
+- After the calendar and limited research, finish the brief; do not keep searching.
 
 Format per meeting (plain text for ntfy, under 700 characters each):
 Name, Title at Company (time)
@@ -157,26 +165,92 @@ def run_workflow(client, profile):
     return resp.choices[0].message.content, trail
 
 
+def _compact(value, limit=MAX_TOOL_RESULT_CHARS):
+    """Keep tool outputs small so prior searches do not inflate every request."""
+    serialized = json.dumps(value, ensure_ascii=False, default=str)
+    if len(serialized) <= limit:
+        return serialized
+    return json.dumps({"summary": serialized[:limit], "truncated": True}, ensure_ascii=False)
+
+
+def _complete(client, messages, tools=None):
+    """Use bounded outputs; retry a temporary TPM rejection once."""
+    kwargs = {"model": MODEL, "messages": messages, "max_tokens": MAX_COMPLETION_TOKENS}
+    if tools is not None:
+        kwargs["tools"] = tools
+    try:
+        return client.chat.completions.create(**kwargs).choices[0].message
+    except (RateLimitError, APIStatusError) as exc:
+        # 413 is also used for Groq TPM overages. Waiting for the minute to
+        # reset is useful, but compacting context is still essential.
+        if getattr(exc, "status_code", None) not in (413, 429):
+            raise
+        print("Groq rate/token limit reached; waiting 65 seconds before retry.", flush=True)
+        time.sleep(65)
+        return client.chat.completions.create(**kwargs).choices[0].message
+
+
 def run_agent(client, profile):
-    """Goal + tools. The AI picks the next step until it decides it's done."""
+    """Bounded tool-use agent with duplicate-search protection and a final brief."""
     now = datetime.now(TZ).strftime("%A %b %d, %-I:%M %p")
-    messages = [{"role": "system", "content": agent_goal(profile)},
+    goal = agent_goal(profile)
+    messages = [{"role": "system", "content": goal},
                 {"role": "user", "content": f"It's {now}. Prep me for tomorrow."}]
     trail = []
+    search_count = 0
+    searched = set()
+    calendar_result = None
+    research_notes = []
     for step in range(MAX_AGENT_STEPS):
-        msg = client.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS).choices[0].message
+        # Stop offering web search after the cap. Other tools remain available.
+        available = [tool for tool in TOOLS
+                     if search_count < MAX_WEB_SEARCHES or tool["function"]["name"] != "web_search"]
+        msg = _complete(client, messages, tools=available)
         messages.append(msg.model_dump(exclude_none=True))
         if not msg.tool_calls:
-            return msg.content, trail
+            return msg.content or "No brief returned.", trail
         for call in msg.tool_calls:
-            args = json.loads(call.function.arguments or "{}")
-            label = f"{call.function.name}({', '.join(str(v) for v in args.values())})"
-            print(f"Agent step {step + 1}: {label}")
+            name = call.function.name
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            label = f"{name}({', '.join(str(v) for v in args.values())})"
+            print(f"Agent step {step + 1}: {label}", flush=True)
             trail.append(label)
-            result = run_tool(call.function.name, args)
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, default=str)})
-    messages.append({"role": "user", "content": "Stop researching and write the briefs now."})
-    return client.chat.completions.create(model=MODEL, messages=messages).choices[0].message.content, trail
+            if name == "web_search":
+                query = str(args.get("query", "")).strip()
+                # Word-set signature catches near-identical query rephrasings.
+                signature = frozenset(re.findall(r"[a-z0-9]+", query.lower()))
+                if not query or search_count >= MAX_WEB_SEARCHES:
+                    result = {"error": "Web search budget exhausted. Finish the brief."}
+                elif any(signature == old or (signature and old and
+                         len(signature & old) / len(signature | old) >= 0.65) for old in searched):
+                    result = {"error": "Similar search already performed. Use existing evidence."}
+                else:
+                    searched.add(signature)
+                    search_count += 1
+                    result = run_tool(name, args)
+            else:
+                result = run_tool(name, args)
+            if name == "get_tomorrows_events":
+                calendar_result = result
+            elif name in ("web_search", "company_news"):
+                research_notes.append({"tool": name, "args": args, "result": result})
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": _compact(result)})
+
+    # Do not pass the growing tool-call transcript into the final request.
+    # Build a short standalone prompt so a long search history cannot cause 413.
+    final_messages = [
+        {"role": "system", "content": goal},
+        {"role": "user", "content":
+         "Write the final networking briefs now. No more tools or searches. "
+         "Use only the evidence below; label unknowns, never invent details.\n"
+         f"Calendar: {_compact(calendar_result, 3500)}\n"
+         f"Research: {_compact(research_notes, 3500)}"},
+    ]
+    return _complete(client, final_messages).content or "No brief returned.", trail
 
 
 # ---------------------------------------------------------------- delivery
