@@ -1,0 +1,4 @@
+requests>=2.31
+openai>=1.40
+icalendar>=5.0
+recurring-ical-events>=2.0
